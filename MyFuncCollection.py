@@ -133,6 +133,9 @@ def plot_ols(est_params, x, y, x_plot):
 #===
 # AESARA \xi SOLVER
 #
+# See for reference: https://docs.pymc.io/en/v3/Advanced_usage_of_Theano_in_PyMC3.html
+# Reference still applies for pymc4, just use aesara instead of theano
+#
 
 from scipy import optimize
 from scipy import special
@@ -162,8 +165,8 @@ def fprime_xi(xi, z_bc):
         print(g1)
         print(g2)
     return fprime
-def xi_from_zbc(z_bc, init_guess):
-    return optimize.newton(func_xi, init_guess, fprime = fprime_xi, args=(z_bc,))
+def xi_from_zbc(z_bc, init_guess, **kwargs):
+    return optimize.newton(func_xi, init_guess, fprime = fprime_xi, args=(z_bc,), **kwargs)
 
 at_x = at.dvector('at_x')
 at_z = at.switch(at.le(at_x,1e1), -1e-1, 
@@ -216,6 +219,8 @@ at_xi_from_zbc = XiFromZbc()
 # 2. GEV equivalent parameterisation and CDF comaparison assumes convergence to GEV, and support ONLY Weibull domain of attraction
 #
 #TO DO:
+# IMPORTANT: COME UP WITH A BETTER NUMERICAL INTEGRATION. Its currently producing inaccurate results at large N
+# ROMBERG INTEGRATION ISNT WORKING. NEED TO REDO
 # 1. Some scipy equivalent methods are not coded yet (e.g. entropy, median)
 # 2. Some sort of hypothesis testing to check if the genmaxima distribution has converged to a GEV distribution
 #
@@ -227,6 +232,13 @@ from scipy.stats import genextreme
 
 class genmaxima():
     r"""Class for generic maxima random variable
+    
+    **Critical Note**: Numerical instability at large and 0 < N << 1 has been observed. The root cause is due to errors from numerical integration that are used
+    to calculate the statistical moments. Please use with caution!. Any suggestions to improve this is more than welcomed!
+    
+    To circumvent this, it is recommended to convert this distribution to a genxtreme_WR object via get_genxtreme_WR() method. From there, you can
+    proceed all statistical analysis again assuming that your distribution has converged. **Note this is only available for parent distributions**
+    **with bounded upper bound and Weibull domain of attraction**. It is your responsibility to check the domain of attraction and convergence to GEV distribution
     
     Arguments:
     parent: 
@@ -274,7 +286,10 @@ class genmaxima():
         return self.ppf(u)
     
     def pdf(self, x):
-        return self.N * (self.parent.cdf(x) ** (self.N - 1)) * self.parent.pdf(x)
+        #Assume that if return nan, the pdf is zero
+        parent_F = self.parent.cdf(x)
+        t2 = np.power(parent_F, (self.N - 1), out = np.zeros_like(x), where = (parent_F != 0)) 
+        return self.N * t2 * self.parent.pdf(x)
     
     def logpdf(self, x):
         return np.log(self.N) + (self.N - 1) * self.parent.logcdf(x) + self.parent.logpdf(x)
@@ -319,60 +334,109 @@ class genmaxima():
     #All moments are calculated numerically, so there will be some numerical error
     
     #Method to calculate non-central moment
-    def moment(self, order):
+    def moment(self, order, integral_method="quad", integral_lb = None, integral_ub = None, **integral_kwargs):
+        if integral_method == "romberg":
+            print("'romberg' integration method contains error right now. Please use with caution!")
+            
+        #Auto set bound if not specified to distribution bounds
+        support = self.get_support()
+        if integral_lb == None:
+            integral_lb = support[0]
+            if (integral_lb == -np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+                print("ERR: 'romberg' integration method selected, but distribution supports -infinite lower bound. Please supply the integral lower bound via 'integral_lb' parameter")
+                return "nan"
+        if integral_ub == None:
+            integral_ub = support[1]
+            if (support[1] == np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+                print("ERR: 'romberg' integration method selected, but distribution supports infinite upport bound. Please supply the integral upper bound via 'integral_ub' parameter")
+                return "nan"
+        
         #function x^k * f(x), for uncentered moment calculations
         def xk_fx(x):
             return (x**order) * self.pdf(x)
+        
         #Integrate via numerical method
-        support = self.get_support()
-        return integrate.quad(func = xk_fx, a = support[0], b = support[1])[0]
+        if integral_method == "quad":
+            return integrate.quad(func = xk_fx, a = integral_lb, b = integral_ub, **integral_kwargs)[0]
+        elif integral_method == "romberg":
+            return integrate.romberg(function = xk_fx, a = integral_lb, b = integral_ub, **integral_kwargs)
+        else:
+            print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
+            return "nan"
     
     #Method to calculate standardised moment
     #Unique to this, not availabel in scipy. Maybe better to code the expect() method for this
-    def std_moment(self, order):
-        first_moment = self.moment(order=1)
+    def std_moment(self, order, integral_method="quad", integral_lb = None, integral_ub = None, **integral_kwargs):
+        #Auto set bound if not specified to distribution bounds
+        support = self.get_support()
+        if integral_lb == None:
+            integral_lb = support[0]
+            if (integral_lb == -np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+                print("ERR: 'romberg' integration method selected, but distribution supports -infinite lower bound. Please supply the integral lower bound via 'integral_lb' parameter")
+                return "nan"
+        if integral_ub == None:
+            integral_ub = support[1]
+            if (support[1] == np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+                print("ERR: 'romberg' integration method selected, but distribution supports infinite upport bound. Please supply the integral upper bound via 'integral_ub' parameter")
+                return "nan"
+        
+        first_moment = self.moment(order=1, integral_method = integral_method, integral_lb = integral_lb, integral_ub = integral_ub, **integral_kwargs)
         if order==1:
             return first_moment
         else:
             #shifted and translated, for standardised moment calculations
             def std_xk_fx(x, translation, scale):
                 return (((x-translation)/scale) ** order) * self.pdf(x)
-            support = self.get_support()
-            second_centered_moment = integrate.quad(func = std_xk_fx, a = support[0], b = support[1], args = (first_moment, 1))[0]
+            
+            if integral_method == "quad":
+                second_centered_moment = integrate.quad(func = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, 1), **integral_kwargs)[0]
+            elif integral_method == "romberg":
+                second_centered_moment = integrate.romberg(function = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, 1), **integral_kwargs)
+            else:
+                print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
+                return "nan"
+                
             if order==2:
                 return second_centered_moment
             else:
-                return integrate.quad(func = std_xk_fx, a = support[0], b = support[1], args = (first_moment, second_centered_moment))[0]
+                if integral_method == "quad":
+                    return integrate.quad(func = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, second_centered_moment), **integral_kwargs)[0]
+                elif integral_method == "romberg":
+                    return integrate.romberg(function = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, second_centered_moment), **integral_kwargs)
+                else:
+                    print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
+                    return "nan"
             
     #Method to get statistics, similar to stats() method in scipy distribution
     #Does not behave exactly the same as scipy. Need to code properly.
-    def stats(self, moments):
+    def stats(self, moments, **kwargs):
         moments = list(moments)
         for a in moments:
             if a == 'm':
-                return self.moment(order = 1)
+                return self.moment(order = 1, **kwargs)
             elif a == 'v':
-                return self.std_moment(order = 2)
+                return self.std_moment(order = 2, **kwargs)
             elif a == 's':
-                return self.std_moment(order = 3)
+                return self.std_moment(order = 3, **kwargs)
             elif a == 'k':
-                return self.std_moment(order = 4)
+                return self.std_moment(order = 4, **kwargs)
             else:
                 print("Unrecognised 'moments' argument. Should be 'm', 'v', 's', 'k', or combinations of those. See scipy doc for detail")
     
-    def mean(self):
-        return self.moment(order = 1)
+    def mean(self, **kwargs):
+        return self.moment(order = 1, **kwargs)
     
-    def var(self):
-        return self.std_moment(order = 2)
+    def var(self, **kwargs):
+        return self.std_moment(order = 2, **kwargs)
     
-    def std(self):
-        return np.sqrt(self.var())
+    def std(self, **kwargs):
+        return np.sqrt(self.var(**kwargs))
     
     def median(self):
         print("NOT CODED YET")
         return "nan"
     
+    # Methods to calculate equivalent GEV
     def get_genextreme_parameter(self, parameterisation = "coles"):
         """
         Calculate the "equivalent" GEV parameters
@@ -397,7 +461,7 @@ class genmaxima():
             dist_std = self.std()
             dist_zbc = (upper_bound - dist_mean)/dist_std #centered upper bound
             
-            xi = xi_from_zbc(dist_zbc, init_guess([z_bc]))[0];
+            xi = xi_from_zbc(dist_zbc, init_guess([dist_zbc]))[0];
             g1 = special.gamma(1-xi)
             kx = (dist_mean - upper_bound)/g1
             sigma = kx*xi
@@ -455,3 +519,256 @@ class genmaxima():
         else:
             print("Unsupported parent distribution. Only support parent with bounded upper bound.")
             return "nan";
+    
+    #Method to return reparameterised GEV distribution with Weivbull domain of attraction (genextreme_WR object)
+    def get_genextreme_WR_dist(self, warning = True):
+        #
+        # TO DO:
+        # Should check for convergence here
+        #
+        if warning:
+            print("Warning: returned GEV distribution assumes 1) Convergence, 2) Weibull domain of attraction")
+            print("It is your responsibility to check both of these assumptions")
+        
+        upper_bound = self.get_support()[1]
+        if (upper_bound < np.inf) and np.isreal(upper_bound):
+            return genextreme_WR(E = self.mean(), V = self.var(), z_b = self.support()[1])
+        else:
+            print("Unsupported parent distribution. Only support parent with bounded upper bound.")
+            print("Please also check the domain of attraction!")
+            return "nan";
+    
+    #Method to return scipy genextreme distribution (scipy.stats.genextreme object)
+    def get_genextreme_dist(self, warning = True):
+        #
+        # TO DO:
+        # Should check for convergence here
+        #
+        
+        if warning:
+            print("Warning: returned GEV distribution assumes 1) Convergence, 2) Weibull domain of attraction")
+            print("It is your responsibility to check both of these assumptions")
+            
+        if (upper_bound < np.inf) and np.isreal(upper_bound):
+            param = self.get_genextreme_parameter(parameterisation='scipy');
+            return genextreme(loc = param[0], scale = param[1], c = param[2])
+        else:
+            print("Unsupported parent distribution. Only support parent with bounded upper bound.")
+            print("Please also check the domain of attraction!")
+            return "nan";
+    
+    
+        
+#=======================================
+#         genmaxima() class
+#=======================================
+
+        
+class genextreme_WR():
+    r"""Reparameterised GEV Distribution, Strictly for Weibull Domain of Attraction
+    Reparameterised genextreme distribution (GEV distribution), based on mean (E), variance(V), and upper bound (z_b).
+    Allows the calculation of all statistical properties (mean, var, CDF, etc.) when raised to the power of N.
+    That is equivalent to taking the maxima from a GEV distribution with block size = N.
+    Still allows the regular parameterisation too.
+    
+    **Only support Weibull Domain of Attraction**
+    i.e. z_b < infinity and xi < 0
+    
+    Note on the definition of N:
+    The larger the N, the larger the size of the block is. For instance if you have 10 million samples, and then
+    you get the maxima every 1,000 samples, i.e. now you have 10,000 samples of the maxima, then N = 1,000
+    Note that N need not to be an integer. The mathematics works for non integer N. e.g. if you have maxima data only, '
+    each with block size 1,000, you could theoretically find equivalent GEV distributions of sample with block maxima of 
+    10 by setting N = 10/1,000 = 0.01. Note that there are caveats to this, and the interpretation is up to you as the user.
+    
+    """
+    def __init__(self, E = None, V = None, z_b = None, mu  = None, sigma = None, xi = None, parameterisation = 'coles'):
+        #For the purpose of all calculation shall be done in coles parameterisation. Output can be specified to be in scipy if desired by the user.        
+        self.parameterisation = parameterisation
+        if (not (E==None)) and (not (V==None)) and (not (z_b==None)):
+            self.E = E
+            self.V = V
+            self.z_b = z_b
+            og_param = self.calculate_og_base_parameter()
+            self.mu = og_param[0]
+            self.sigma = og_param[1]
+            self.xi = og_param[2]
+        elif (not (mu==None)) and (not (sigma==None)) and (not (xi==None)):
+            self.mu = mu
+            self.sigma = sigma
+            if parameterisation == 'coles':
+                self.xi = xi
+            elif parameterisation == 'scipy':
+                self.xi = -xi
+            else:
+                print("Error 'parameterisation' argument must be either 'coles' or 'scipy'")
+            self.E = self.mean()
+            self.V = self.var()
+            self.z_b = self.get_support()[1]
+        else:
+            print("Error: Either 'E', 'V' and 'z_b' must be supplied, or 'mu', 'sigma' and 'xi'")
+        
+        if not self.argcheck():
+            print("Error parameter out of bounds")
+            
+    
+    def argcheck(self):
+        return ((self.sigma > 0) \
+                and (self.xi < 0) \
+                and (self.V > 0) \
+                and (self.z_b < np.inf) \
+                and (self.z_b > -np.inf) \
+                and np.isreal(self.z_b) \
+                and (self.z_b > self.E))
+    
+    def support(self):
+        #Alias for get_support
+        return self.get_support()
+    
+    def get_support(self):
+        return genextreme(loc = self.mu, scale = self.sigma, c = -self.xi).support()
+    
+    def calculate_og_base_parameter(self, parameterisation = 'coles'):
+        z_bc = (self.z_b - self.E) / np.sqrt(self.V)
+        xi = xi_from_zbc(z_bc, init_guess([z_bc]))[0]
+        g1 = special.gamma(1-xi)
+        kx = (self.E - self.z_b)/g1
+        sigma = kx * xi
+        mu = self.E - kx * (g1-1)
+        if parameterisation == 'coles':
+            return (mu, sigma, xi)
+        elif parameterisation == 'scipy':
+            return (mu, sigma, -xi)
+        else:
+            print("Error 'parameterisation' argument must be either 'coles' or 'scipy'")
+            return ("nan", "nan", "nan")
+    
+    #All the methods from this point allows raising of the distribution to the power of N, for some N>0
+    #This is equivalent to taking the maxima of sample with block size = N
+    #Based on C. Caprani (2004)
+    
+    def get_parameter(self, N=1):
+        N = 1/N #Invert input N to mathematical N. Same with all the rest of the methods.
+        if N==1:
+            return (self.E, self.V, self.z_b)
+        elif N>0:
+            raised_og_parameter = get_og_parameter(N=N)
+            mu_N = raised_og_parameter[0]
+            sigma_N = raised_og_parameter[1]
+
+            E_N = mu_N + (sigma_N/self.xi) * (special.gamma(1-self.xi) - 1)
+            V_N = np.abs((sigma_N/self.xi) * np.sqrt(special.gamma(1-2*self.xi) - special.gamma(1-self.xi)**2))
+            return (E_N, V_N, self.z_b)
+        else:
+            print("Invalid argument 'N'. 'N' must be larger than 0")
+            return ("nan", "nan", "nan")
+                         
+    
+    def get_og_parameter(self, N=1, parameterisation = 'coles'):
+        #Note that the mathematical definition and the definition used in this function is inverted. So
+        # the input N = 1 / mathematical N
+        N = 1/N #Invert input N to mathematical N.
+        if N==1:
+            if parameterisation == 'coles':
+                return (self.mu, self.sigma, self.xi)
+            elif parameterisation == 'scipy':
+                return (self.mu, self.sigma, -self.xi)
+            else:
+                print("Error 'parameterisation' argument must be either 'coles' or 'scipy'")
+                return ("nan", "nan", "nan")
+        elif N>0:
+            mu_N = self.mu - (self.sigma/self.xi)*(1 - N**(-self.xi))
+            sigma_N = self.sigma * N**(-self.xi)
+            if parameterisation == 'coles':
+                return (mu_N, sigma_N, self.xi)
+            elif parameterisation == 'scipy':
+                return (mu_N, sigma_N, -self.xi)
+            else:
+                print("Error 'parameterisation' argument must be either 'coles' or 'scipy'")
+                return ("nan", "nan", "nan")
+        else:
+            print("Invalid argument 'N'. 'N' must be larger than 0")
+            return ("nan", "nan", "nan")
+    
+    def rvs(self, size=1, random_state=None, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).rvs(size=size, random_state=random_state)
+        
+    def pdf(self, x, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).pdf(x)
+    
+    def logpdf(self, x, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).logpdf(x)
+    
+    def cdf(self, x, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).cdf(x)
+    
+    def logcdf(self, x, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).logcdf(x)
+    
+    def sf(self, x, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).sf(x)
+    
+    def logsf(self, x, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).logsf(x)
+    
+    def ppf(self, q, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).ppf(q)
+    
+    def isf(self, q, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).isf(q)
+    
+    def moment(self, order, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).moment(order=order)
+    
+    def stats(self, moments='mv', N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).stats(moments=moments)
+    
+    def entropy(self, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).entropy()
+    
+    def fit(self, data, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).fit(data)
+    
+    def expect(self, func, args=(), lb=None, ub=None, conditional=False, N=1, **kwds):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return enextreme(loc = param[0], scale = param[1], c = param[2]).expect(
+            func = func, 
+            args = args, 
+            lb = lb, 
+            ub = ub, 
+            conditional = conditional, 
+            kwds = kwds,
+        )
+    
+    def median(self, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).median()
+    
+    def mean(self, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).mean()
+    
+    def var(self, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).var()
+    
+    def std(self, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).std()
+    
+    def interval(self, confidence, N=1):
+        param = self.get_og_parameter(N=N, parameterisation = 'scipy')
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).interval(confidence=confidence)
