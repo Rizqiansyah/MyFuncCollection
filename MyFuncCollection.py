@@ -206,6 +206,39 @@ class XiFromZbc(Op):
         
         return [g[0] * nom/denom]
     
+#JAX implementation
+#Ref: https://aesara.readthedocs.io/en/latest/extending/creating_a_numba_jax_op.html
+#NOT WORKING!
+
+"""
+from aesara.link.jax.dispatch import jax_funcify
+#import jax.scipy.special as jss
+import jax.lax as jlax
+
+@jax_funcify.register(XiFromZbc)
+def jax_funcify_XiFromZbc(op, node, storage_map, **kwargs):
+    itypes = op.itypes
+    otypes = op.otypes
+    
+    def perform(self, node, inputs, outputs):
+        zbc, = inputs
+        xi = xi_from_zbc(zbc, init_guess(z_bc))
+        outputs[0][0] = np.array(xi)
+        
+    def grad(self, inputs, g):
+        z_bc, = inputs
+        xi = self(z_bc)
+        g1 = jlax.exp(jlax.lgamma(1-xi))
+        g2 = jlax.exp(jlax.lgamma(1-2*xi))
+        dg1 = jlax.digamma(1-xi)
+        dg2 = jlax.digamma(1-2*xi)
+        
+        nom = jlax.pow(g2-jlax.pow(g1, 2), 1.5)
+        denom = g1*g2*(dg2 - dg1)
+        
+        return [g[0] * nom/denom]
+"""
+    
 at_xi_from_zbc = XiFromZbc()
 
 #=======================================
@@ -278,12 +311,68 @@ class genmaxima():
         #Should be the same as the parent, although need more study to verify
         return self.parent.support()
     
-    def rvs(self, size=1, random_state=None):
+    def rvs(self, size=1, random_state=None, method="direct", progress_bar=None, max_mem = int(1e8)):
+        
         """
         Generate random number. Follows scipy arguments.
+        Two different sampling methods, set via 'method' argument:
+        1. 'direct': Directly sample from the genmaxima distribution
+        2. 'parent': Sample from parent, then take block maxima. Only available for N is integer and N >= 1 
         """
-        u = uniform.rvs(size = size, random_state = random_state)
-        return self.ppf(u)
+        
+        if method == 'direct':
+            u = uniform.rvs(size = size, random_state = random_state)
+            return self.ppf(u)
+        
+        elif method == 'parent':
+            #Check that N>=1
+            if (self.N < 1):
+                print("Invalid N for sampling method 'parent'. N must be equal or larger than 1 to use 'parent' sampling method")
+                return "nan"
+            if not isinstance(self.N, int):
+                print("Invalid N for sampling method 'parent'. N must be an integer ('int' instance)")
+                return "nan"
+            
+            max_mem = int(max_mem)
+            
+            #Determine if we can sample all at once, or need to be looped
+            if (self.N * size) > max_mem:
+                #Loop sample
+                out_arr = np.zeros(size)
+                #Determine max number of parallel sampling
+                max_parallel_dim = max(int(max_mem/self.N),1)
+                #Calculate the amount of loops needed
+                num_loops = int(np.ceil(size/max_parallel_dim))
+                
+                if (progress_bar == False) or (num_loops < 2):
+                    for i in range(0,num_loops):
+                        #Calculate index to store
+                        start_idx = i*max_parallel_dim
+                        end_idx = np.min(((i+1)*max_parallel_dim, size))
+                        num_parallel_dim = end_idx-start_idx
+                        #Sample
+                        out_arr[start_idx:end_idx] = np.max(self.parent.rvs(size=(self.N, num_parallel_dim), 
+                                                                            random_state=random_state), 
+                                                            axis = 0)
+                else:
+                    from tqdm import tqdm
+                    for i in tqdm(range(0,num_loops)):
+                        #Calculate index to store
+                        start_idx = i*max_parallel_dim
+                        end_idx = np.min(((i+1)*max_parallel_dim, size))
+                        num_parallel_dim = end_idx-start_idx
+                        #Sample
+                        out_arr[start_idx:end_idx] = np.max(self.parent.rvs(size=(self.N, num_parallel_dim), 
+                                                                            random_state=random_state), 
+                                                            axis = 0)
+            else:
+                out_arr = retake_block_max(self.parent.rvs(size=(self.N*size), random_state=random_state), self.N)
+                
+            return out_arr
+        else:
+            print("Invalid 'method' argument specified. Must be either 'direct' or 'parent'")
+            return "nan"
+            
     
     def pdf(self, x):
         #Assume that if return nan, the pdf is zero
@@ -548,7 +637,8 @@ class genmaxima():
         if warning:
             print("Warning: returned GEV distribution assumes 1) Convergence, 2) Weibull domain of attraction")
             print("It is your responsibility to check both of these assumptions")
-            
+        
+        upper_bound = self.get_support()[1]
         if (upper_bound < np.inf) and np.isreal(upper_bound):
             param = self.get_genextreme_parameter(parameterisation='scipy');
             return genextreme(loc = param[0], scale = param[1], c = param[2])
@@ -647,21 +737,51 @@ class genextreme_WR():
     #This is equivalent to taking the maxima of sample with block size = N
     #Based on C. Caprani (2004)
     
-    def get_parameter(self, N=1):
+    def get_parameter(self, N=1, method='og'):
+        """
+        Method to get the parameter mean, variance and upper bound (E, V, and z_b)
+        Raised to the power of N. Default N to 1.
+        
+        'method' argument can be either 'og' or 'direct'.
+        'og' calculates the parameter via mu, sigma and xi. Ref: Caprani, 2004. Coles, 2001.
+        'direct' calculates the parameters directly.
+        Either method in theory should produce the same results, barring some floating point error.
+        Use method check_get_parameter() to check if both methods agree, and the difference in them.
+        """
         N = 1/N #Invert input N to mathematical N. Same with all the rest of the methods.
         if N==1:
             return (self.E, self.V, self.z_b)
         elif N>0:
-            raised_og_parameter = get_og_parameter(N=N)
-            mu_N = raised_og_parameter[0]
-            sigma_N = raised_og_parameter[1]
+            if method == 'og':
+                raised_og_parameter = self.get_og_parameter(N=1/N) #Note on inversion of N due the difference in definition
+                mu_N = raised_og_parameter[0]
+                sigma_N = raised_og_parameter[1]
 
-            E_N = mu_N + (sigma_N/self.xi) * (special.gamma(1-self.xi) - 1)
-            V_N = np.abs((sigma_N/self.xi) * np.sqrt(special.gamma(1-2*self.xi) - special.gamma(1-self.xi)**2))
+                E_N = mu_N + (sigma_N/self.xi) * (special.gamma(1-self.xi) - 1)
+                V_N = np.abs((sigma_N**2/self.xi**2) * (special.gamma(1-2*self.xi) - special.gamma(1-self.xi)**2))
+            elif method == 'direct':
+                E_N = self.E / (N ** self.xi) - self.z_b * ( 1/(N ** self.xi) - 1 )
+                V_N = self.V / (N ** (2*self.xi))
+            else:
+                print("Invalid argument 'method'. Should be either 'og' or 'direct'")
+                return ("nan", "nan", "nan")
+            
             return (E_N, V_N, self.z_b)
         else:
             print("Invalid argument 'N'. 'N' must be larger than 0")
             return ("nan", "nan", "nan")
+        
+    def check_get_parameter(self, N = 1):
+        """
+        Method to check the difference between 'og' and 'direct' in get_parameter() method
+        Return two tuples. First tuple is the difference, second tuple is if they are within machine tolerance using numpy isclose() function.
+        """
+        og = self.get_parameter(N=N, method='og')
+        direct = self.get_parameter(N=N, method='direct')
+        diff = ( og[0] - direct[0], og[1] - direct[1], og[2] - direct[2] )
+        close = ( np.isclose(og[0], direct[0]), np.isclose(og[1], direct[1]), np.isclose(og[2], direct[2]) )
+        return (diff, close)
+        
                          
     
     def get_og_parameter(self, N=1, parameterisation = 'coles'):
