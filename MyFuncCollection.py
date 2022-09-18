@@ -1,7 +1,10 @@
 import numpy as np
-from scipy import stats
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
+from scipy import stats
+from scipy import integrate
+from scipy.stats import uniform
+from scipy.stats import genextreme
 
 #Gaussian KDE
 def bounded_gaussian_kde(samples):
@@ -242,6 +245,389 @@ def jax_funcify_XiFromZbc(op, node, storage_map, **kwargs):
 at_xi_from_zbc = XiFromZbc()
 
 #=======================================
+#             zbc_from_xi()
+#=======================================
+"""
+Inverse of xi_from_zbc_function. This one is more straightforward.
+Here for convenience.
+
+NOTE: the aesara solver has not been tested yet! use with caution!
+"""
+
+def zbc_from_xi(xi):
+    return special.gamma(1-xi) / np.sqrt(special.gamma(1-2*xi) - special.gamma(1-xi)**2)
+
+def at_zbc_from_xi(xi):
+    return at.gamma(1-xi) / at.sqrt(at.gamma(1-2*xi) - at.pow(at.gamma(1-xi), 2))
+
+
+#=======================================
+#      Numerical Moment Functions
+#=======================================
+
+#Calculate non-central or central moments numericaly. Useful when there is no (readily available) closed form expresion of the moments
+#Arguments:
+#fx = The PDF of the distribution
+#order = The k-th moment
+#integral_lb = The lower limit of the integral
+#integral_ub = The lower limit of the integral
+#integral_method = The numerical method of integration
+#**integral_kwargs = kwargs to be passed to the integration function
+
+def numerical_moment(fx, order, integral_lb, integral_ub, integral_method="quad", **integral_kwargs):
+    if integral_method == "romberg":
+        print("'romberg' integration method contains error right now. Please use with caution!")
+            
+        if (integral_lb == -np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+            print("ERR: 'romberg' integration method selected, integral_lb must be > -infinity")
+            return "nan"
+
+        if (integral_ub == np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+            print("ERR: 'romberg' integration method selected, integral_ub must be < infinity")
+            return "nan"
+        
+    #function x^k * f(x), for uncentered moment calculations
+    def xk_fx(x):
+        return (x**order) * fx(x)
+
+    #Integrate via numerical method
+    if integral_method == "quad":
+        return integrate.quad(func = xk_fx, a = integral_lb, b = integral_ub, **integral_kwargs)[0]
+    elif integral_method == "romberg":
+        return integrate.romberg(function = xk_fx, a = integral_lb, b = integral_ub, **integral_kwargs)
+    else:
+        print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
+        return "nan"
+        
+def numerical_standardised_moment(fx, order, integral_lb, integral_ub, integral_method="quad", **integral_kwargs):
+    if integral_method == "romberg":
+        print("'romberg' integration method contains error right now. Please use with caution!")
+            
+        if (integral_lb == -np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+            print("ERR: 'romberg' integration method selected, integral_lb must be > -infinity")
+            return "nan"
+        
+        if (integral_ub == np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
+            print("ERR: 'romberg' integration method selected, integral_ub must be < infinity")
+            return "nan"
+
+    first_moment = numerical_moment(fx = fx, 
+                                    order = 1, 
+                                    integral_lb = integral_lb, 
+                                    integral_ub = integral_ub, 
+                                    integral_method = integral_method, 
+                                    **integral_kwargs)
+    if order==1:
+        return first_moment
+    else:
+        #shifted and translated, for standardised moment calculations
+        def std_xk_fx(x, k, translation, scale):
+            return (((x-translation)/scale) ** k) * fx(x)
+
+        if integral_method == "quad":
+            second_centered_moment = integrate.quad(func = std_xk_fx, a = integral_lb, b = integral_ub, args = (2, first_moment, 1), **integral_kwargs)[0]
+        elif integral_method == "romberg":
+            second_centered_moment = integrate.romberg(function = std_xk_fx, a = integral_lb, b = integral_ub, args = (2, first_moment, 1), **integral_kwargs)
+        else:
+            print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
+            return "nan"
+
+        if order==2:
+            return second_centered_moment
+        else:
+            if integral_method == "quad":
+                return integrate.quad(func = std_xk_fx, a = integral_lb, b = integral_ub, args = (order, first_moment, np.sqrt(second_centered_moment)), **integral_kwargs)[0]
+            elif integral_method == "romberg":
+                return integrate.romberg(function = std_xk_fx, a = integral_lb, b = integral_ub, args = (order, first_moment, np.sqrt(second_centered_moment)), **integral_kwargs)
+            else:
+                print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
+                return "nan"
+
+#=======================================
+#         gentruncated() class
+#=======================================
+#Generic Truncated Distribution
+#Provide a class for upper, lower, and upper & lower trucated distribution, for any parent distribution
+#REF: https://timvieira.github.io/blog/post/2020/06/30/generating-truncated-random-variates/
+
+class gentruncated():
+    r""" Class for generic truncated random variable
+    Arguments:
+    parent:
+        The parent distribution.
+    lower:
+        The lower truncation point. If "lower" argument is less than equal the parent support, will use methods from the parent itself + a warning (surpressable).
+        Default is "None" for no lower truncation.
+    
+    upper:
+        The upper truncation point. If "upper" argument is more than equal the parent support, will use methods from the parent itself + a warning (surpressable).
+        Default is "None" for no upper truncation.
+    """
+    
+    #Helper methods since not using rv_continuous class from scipy
+    def __init__(self, parent, lower = None, upper = None, warning = True):
+        self.parent = parent
+        self._set_lower(lower, warning)
+        self._set_upper(upper, warning)
+        if not self.argcheck():
+            raise ValueError("lower truncation point is set equal to or higher than upper truncation point. Check the truncation points!")
+            
+    def _set_lower(self, lower, warning = True):
+        if lower == None:
+            self.lower = self.parent.support()[0]
+            self.lower_flag = True
+        else:
+            self.lower = lower
+            self.check_lower_support(warning)
+            
+    def _set_upper(self, upper, warning = True):
+        if upper == None:
+            self.upper = self.parent.support()[1]
+            self.upper_flag = True
+            self._upper_flag_is_none = True
+        else:
+            self.upper = upper
+            self.check_upper_support(warning)
+        
+    def check_lower_support(self, warning = True):
+        if self.parent.support()[0] >= self.lower:
+            if warning:
+                print("Warning: lower truncation point is set lower than or equal to parent lower support.")
+            self.lower_flag = True
+            return True
+        elif self.lower >= self.parent.support()[1]: #Lower truncation higher than parent upper support
+            raise ValueError("Lower truncation point CANNOT be higher or equal than parent upper support. Check both parent support and truncation point!")
+        else:
+            self.lower_flag = False
+            return False
+    
+    def check_upper_support(self, warning = True):
+        if self.parent.support()[1] <= self.upper:
+            if warning:
+                print("Warning: upper truncation point is set higher than or equal to parent upper support.")
+            self.upper_flag = True
+            return True
+        elif self.upper <= self.parent.support()[0]: #Upper truncation lower than parent lower support
+            raise ValueError("Upper truncation point CANNOT be lower or equal than parent lower support. Check both parent support and truncation point!")
+        else:
+            self.upper_flag = False
+            return False
+        
+    def check_support(self, warning = True):
+        self.check_lower_support(warning)
+        self.check_upper_support(warning)
+        
+    def set_parent(self, parent, warning = True):
+        if warning:
+            print("WARNING: This method may contain bugs with the truncation point support. It is recommended you create a new gentruncated object instead! ")
+        self.parent = parent
+        self._set_lower(self.lower, warning)
+        self._set_upper(self.upper, warning)
+        if not self.argcheck():
+            raise ValueError("lower truncation point is set equal to or higher than upper truncation point. Check the truncation points!")
+    
+    def get_parent(self):
+        return self.parent
+    
+    def set_lower(self, lower, warning = True):
+        self._set_lower(lower, warning)
+        if not self.argcheck():
+            raise ValueError("lower truncation point is set equal to or higher than upper truncation point. Check the truncation points!")
+    
+    def get_lower(self):
+        return self.lower
+    
+    def set_upper(self, upper, warning = True):
+        self._set_upper(upper, warning)
+        if not self.argcheck():
+            raise ValueError("lower truncation point is set equal to or higher than upper truncation point. Check the truncation points!")
+    
+    def get_upper(self):
+        return self.upper
+    
+    # Methods similar to scipy, where possible
+    def argcheck(self):
+        if self.lower >= self.upper:
+            return False
+        else:
+            return True
+    
+    def support(self):
+        #Alias for get_support() method
+        return self.get_support()
+    
+    def get_support(self):
+        if self.lower_flag:
+            lower = self.parent.support()[0]
+        else:
+            lower = self.lower
+        
+        if self.upper_flag:
+            upper = self.parent.support()[1]
+        else:
+            upper = self.upper
+        return (lower, upper)
+    
+    def _get_F_support(self):
+        #Method to get CDF at the truncation points/ support
+        if self.lower_flag:
+            F_a = 0
+        else:
+            F_a = self.parent.cdf(self.lower)
+        
+        if self.upper_flag:
+            F_b = 1.0
+        else:
+            F_b = self.parent.cdf(self.upper)
+        return (F_a, F_b)
+    
+    def rvs(self, size=1, random_state=None):
+        u = uniform.rvs(size = size, random_state = random_state)
+        return self.ppf(u)
+        
+    def pdf(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        F_a, F_b = self._get_F_support()
+        out = np.zeros(x.shape)
+        x_filter = np.logical_and(x >= self.lower, x <= self.upper)
+        out[x_filter] = self.parent.pdf(x[x_filter]) / (F_b - F_a)
+        return out
+    
+    def logpdf(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        F_a, F_b = self._get_F_support()
+        out = np.ones(x.shape) * -np.inf
+        x_filter = np.logical_and(x >= self.lower, x <= self.upper)
+        out[x_filter] = self.parent.logpdf(x[x_filter]) - np.log(F_b - F_a)
+        return out
+        
+    def cdf(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        F_a, F_b = self._get_F_support()
+        out = np.zeros(x.shape)
+        out[x > self.upper] = 1
+        x_filter = np.logical_and(x >= self.lower, x <= self.upper)
+        out[x_filter] = (self.parent.cdf(x[x_filter]) - F_a) / (F_b - F_a)
+        return out
+    
+    def logcdf(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        F_a, F_b = self._get_F_support()
+        out = np.ones(x.shape) * -np.inf
+        out[x > self.upper] = 0
+        x_filter = np.logical_and(x >= self.lower, x <= self.upper)
+        if self.lower_flag:
+            out[x_filter] = self.parent.logcdf(x[x_filter]) - np.log(F_b)
+        else:
+            out[x_filter] = np.log(self.parent.cdf(x[x_filter]) - F_a) - np.log(F_b - F_a)
+        return out
+    
+    def sf(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        return 1-self.cdf(x)
+    
+    def logsf(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        return np.log(self.sf(x))
+    
+    def ppf(self, q):
+        if not isinstance(q, np.ndarray):
+            q = np.array(q)
+        F_a, F_b = self._get_F_support()
+        return self.parent.ppf(F_a + q*(F_b - F_a))
+    
+    def isf(self, q):
+        print("NOT CODED YET")
+        return "nan"
+    
+    def entropy(self):
+        print("NOT CODED YET")
+        return "nan"
+    
+    def fit(self, data):
+        print("NOT CODED YET")
+        return "nan"
+    
+    def interval(self, confidence):
+        print("NOT CODED YET")
+        return "nan"
+    
+    def expect(self, args=(), lb=None, ub=None, conditional=False, **kwds):
+        print("NOT CODED YET")
+        return "nan"
+    
+    #Methods to calculate statistical moments
+    #All moments are calculated numerically, so there will be some numerical error
+    
+    #Method to calculate non-central moment
+    def moment(self, order, integral_method="quad", integral_lb = None, integral_ub = None, **integral_kwargs):
+        #Auto set bound if not specified to distribution bounds
+        if integral_lb == None:
+            integral_lb = self.get_support()[0]
+        if integral_ub == None:
+            integral_ub = self.get_support()[1]
+        
+        return numerical_moment(fx = self.pdf,
+                                order = order, 
+                                integral_lb = integral_lb, 
+                                integral_ub = integral_ub, 
+                                integral_method = integral_method, 
+                                **integral_kwargs)
+            
+    #Method to calculate standardised moment
+    #Unique to this, not availabel in scipy. Maybe better to code the expect() method for this
+    def std_moment(self, order, integral_method="quad", integral_lb = None, integral_ub = None, **integral_kwargs):
+        #Auto set bound if not specified to distribution bounds
+        if integral_lb == None:
+            integral_lb = self.get_support()[0]
+        if integral_ub == None:
+            integral_ub = self.get_support()[1]
+        
+        return numerical_standardised_moment(fx = self.pdf,
+                                             order = order, 
+                                             integral_lb = integral_lb, 
+                                             integral_ub = integral_ub, 
+                                             integral_method = integral_method, 
+                                             **integral_kwargs)
+    
+    #Method to get statistics, similar to stats() method in scipy distribution
+    #Does not behave exactly the same as scipy. Need to code properly.
+    def stats(self, moments, **kwargs):
+        moments = list(moments)
+        for a in moments:
+            if a == 'm':
+                return self.moment(order = 1, **kwargs)
+            elif a == 'v':
+                return self.std_moment(order = 2, **kwargs)
+            elif a == 's':
+                return self.std_moment(order = 3, **kwargs)
+            elif a == 'k':
+                return self.std_moment(order = 4, **kwargs) - 3.0 #Excess kurtosis
+            else:
+                print("Unrecognised 'moments' argument. Should be 'm', 'v', 's', 'k', or combinations of those. See scipy doc for detail")
+    
+    def mean(self, **kwargs):
+        return self.moment(order = 1, **kwargs)
+    
+    def var(self, **kwargs):
+        return self.std_moment(order = 2, **kwargs)
+    
+    def std(self, **kwargs):
+        return np.sqrt(self.var(**kwargs))
+    
+    def median(self):
+        print("NOT CODED YET")
+        return "nan"
+    
+        
+
+#=======================================
 #         genmaxima() class
 #=======================================
 #Generic Maxima Distribution
@@ -258,10 +644,6 @@ at_xi_from_zbc = XiFromZbc()
 # 2. Some sort of hypothesis testing to check if the genmaxima distribution has converged to a GEV distribution
 #
 # NEED A LOT MORE TESTING
-
-from scipy import integrate
-from scipy.stats import uniform
-from scipy.stats import genextreme
 
 class genmaxima():
     r"""Class for generic maxima random variable
@@ -424,78 +806,35 @@ class genmaxima():
     
     #Method to calculate non-central moment
     def moment(self, order, integral_method="quad", integral_lb = None, integral_ub = None, **integral_kwargs):
-        if integral_method == "romberg":
-            print("'romberg' integration method contains error right now. Please use with caution!")
-            
         #Auto set bound if not specified to distribution bounds
-        support = self.get_support()
         if integral_lb == None:
-            integral_lb = support[0]
-            if (integral_lb == -np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
-                print("ERR: 'romberg' integration method selected, but distribution supports -infinite lower bound. Please supply the integral lower bound via 'integral_lb' parameter")
-                return "nan"
+            integral_lb = self.get_support()[0]
         if integral_ub == None:
-            integral_ub = support[1]
-            if (support[1] == np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
-                print("ERR: 'romberg' integration method selected, but distribution supports infinite upport bound. Please supply the integral upper bound via 'integral_ub' parameter")
-                return "nan"
+            integral_ub = self.get_support()[1]
         
-        #function x^k * f(x), for uncentered moment calculations
-        def xk_fx(x):
-            return (x**order) * self.pdf(x)
-        
-        #Integrate via numerical method
-        if integral_method == "quad":
-            return integrate.quad(func = xk_fx, a = integral_lb, b = integral_ub, **integral_kwargs)[0]
-        elif integral_method == "romberg":
-            return integrate.romberg(function = xk_fx, a = integral_lb, b = integral_ub, **integral_kwargs)
-        else:
-            print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
-            return "nan"
-    
+        return numerical_moment(fx = self.pdf,
+                                order = order, 
+                                integral_lb = integral_lb, 
+                                integral_ub = integral_ub, 
+                                integral_method = integral_method, 
+                                **integral_kwargs)
+            
     #Method to calculate standardised moment
     #Unique to this, not availabel in scipy. Maybe better to code the expect() method for this
     def std_moment(self, order, integral_method="quad", integral_lb = None, integral_ub = None, **integral_kwargs):
         #Auto set bound if not specified to distribution bounds
-        support = self.get_support()
         if integral_lb == None:
-            integral_lb = support[0]
-            if (integral_lb == -np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
-                print("ERR: 'romberg' integration method selected, but distribution supports -infinite lower bound. Please supply the integral lower bound via 'integral_lb' parameter")
-                return "nan"
+            integral_lb = self.get_support()[0]
         if integral_ub == None:
-            integral_ub = support[1]
-            if (support[1] == np.inf) and (integral_method == "romberg"): #Catch error if method is romberg
-                print("ERR: 'romberg' integration method selected, but distribution supports infinite upport bound. Please supply the integral upper bound via 'integral_ub' parameter")
-                return "nan"
+            integral_ub = self.get_support()[1]
         
-        first_moment = self.moment(order=1, integral_method = integral_method, integral_lb = integral_lb, integral_ub = integral_ub, **integral_kwargs)
-        if order==1:
-            return first_moment
-        else:
-            #shifted and translated, for standardised moment calculations
-            def std_xk_fx(x, translation, scale):
-                return (((x-translation)/scale) ** order) * self.pdf(x)
-            
-            if integral_method == "quad":
-                second_centered_moment = integrate.quad(func = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, 1), **integral_kwargs)[0]
-            elif integral_method == "romberg":
-                second_centered_moment = integrate.romberg(function = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, 1), **integral_kwargs)
-            else:
-                print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
-                return "nan"
-                
-            if order==2:
-                return second_centered_moment
-            else:
-                if integral_method == "quad":
-                    return integrate.quad(func = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, second_centered_moment), **integral_kwargs)[0]
-                elif integral_method == "romberg":
-                    return integrate.romberg(function = std_xk_fx, a = integral_lb, b = integral_ub, args = (first_moment, second_centered_moment), **integral_kwargs)
-                else:
-                    print("ERR: Invalid integration method. Please set 'integral_method' to either 'quad' or 'romberg'")
-                    return "nan"
-            
+        return numerical_standardised_moment(fx = self.pdf,
+                                             order = order, 
+                                             integral_lb = integral_lb, 
+                                             integral_ub = integral_ub, 
+                                             integral_method = integral_method, 
+                                             **integral_kwargs)
+        
     #Method to get statistics, similar to stats() method in scipy distribution
     #Does not behave exactly the same as scipy. Need to code properly.
     def stats(self, moments, **kwargs):
@@ -508,7 +847,7 @@ class genmaxima():
             elif a == 's':
                 return self.std_moment(order = 3, **kwargs)
             elif a == 'k':
-                return self.std_moment(order = 4, **kwargs)
+                return self.std_moment(order = 4, **kwargs) - 3.0 #Excess kurtosis
             else:
                 print("Unrecognised 'moments' argument. Should be 'm', 'v', 's', 'k', or combinations of those. See scipy doc for detail")
     
@@ -864,7 +1203,7 @@ class genextreme_WR():
     
     def expect(self, func, args=(), lb=None, ub=None, conditional=False, N=1, **kwds):
         param = self.get_og_parameter(N=N, parameterisation = 'scipy')
-        return enextreme(loc = param[0], scale = param[1], c = param[2]).expect(
+        return genextreme(loc = param[0], scale = param[1], c = param[2]).expect(
             func = func, 
             args = args, 
             lb = lb, 
